@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import io
+import logging
 import os
 import time
 from typing import Any
@@ -13,8 +14,17 @@ from PIL import Image
 
 try:
     from ddgs import DDGS
+    from ddgs.exceptions import DDGSException, RatelimitException
 except ImportError:  # старое имя пакета
     from duckduckgo_search import DDGS
+    try:
+        from duckduckgo_search.exceptions import DuckDuckGoSearchException as DDGSException
+        from duckduckgo_search.exceptions import RatelimitException
+    except ImportError:
+        DDGSException = RatelimitException = Exception
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("locus")
 
 app = FastAPI(title="Locus Image Service")
 
@@ -30,8 +40,8 @@ app.add_middleware(
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
 HF_MODEL = os.getenv("HF_MODEL", "openai/clip-vit-base-patch32")
 HF_ENDPOINTS = [
-    f"https://router.huggingface.co/hf-inference/models/{HF_MODEL}",   # актуальный
-    f"https://api-inference.huggingface.co/models/{HF_MODEL}",         # легаси, на всякий
+    f"https://router.huggingface.co/hf-inference/models/{HF_MODEL}",
+    f"https://api-inference.huggingface.co/models/{HF_MODEL}",
 ]
 
 CANDIDATE_LABELS = [
@@ -54,22 +64,167 @@ MAX_RESULTS = 20
 DOWNLOAD_TIMEOUT = 4.0
 HASH_DISTANCE_THRESHOLD = 5
 HF_TIMEOUT = 8.0
-HF_CONCURRENCY = 4          # HF free tier бьёт 429 при большем
-HF_TOTAL_BUDGET = 18.0      # сек на весь этап классификации
-CLASSIFY_MAX_SIDE = 336     # CLIP всё равно жмёт до 224
+HF_CONCURRENCY = 4
+HF_TOTAL_BUDGET = 18.0
+CLASSIFY_MAX_SIDE = 336
 
+DDG_ATTEMPTS = 2
+DDG_BACKENDS = ["duckduckgo", "brave", "google"]
+WIKI_TIMEOUT = 6.0
+WIKI_LANGS = ["ru", "en", "kk"]
+
+# Wikimedia требует осмысленный User-Agent с контактом, иначе режет по 403.
+CONTACT = os.getenv("CONTACT_EMAIL", "locus-hackathon@example.com")
+WIKI_HEADERS = {"User-Agent": f"LocusBot/1.0 ({CONTACT})"}
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; LocusBot/1.0)"}
+
+BAD_IMAGE_MARKERS = ("logo", "icon", "seal", "coat_of_arms", "emblem", "map", "flag")
+GOOD_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp")
+
 _hf_semaphore = asyncio.Semaphore(HF_CONCURRENCY)
 
 
-# ---------- поиск ----------
+# ---------- поиск: DuckDuckGo ----------
 def _search_images_sync(query: str, limit: int) -> list[dict[str, Any]]:
-    with DDGS() as ddgs:
-        return list(ddgs.images(query, max_results=limit))
+    """Возвращает [] при любой ошибке — решение о фоллбэке принимает вызывающий."""
+    last_error: Exception | None = None
+    for backend in DDG_BACKENDS:
+        for attempt in range(DDG_ATTEMPTS):
+            try:
+                with DDGS() as ddgs:
+                    try:
+                        results = list(ddgs.images(query, max_results=limit, backend=backend))
+                    except TypeError:          # старая сигнатура без backend
+                        results = list(ddgs.images(query, max_results=limit))
+                if results:
+                    log.info("DDG ok: backend=%s, %d результатов", backend, len(results))
+                    return results
+            except RatelimitException as e:
+                last_error = e
+                log.warning("DDG ratelimit (backend=%s, попытка %d)", backend, attempt + 1)
+                time.sleep(1.5 * (attempt + 1))
+            except DDGSException as e:
+                last_error = e
+                log.warning("DDG ошибка (backend=%s): %s", backend, e)
+                break                          # бэкенд сломан — к следующему
+            except Exception as e:
+                last_error = e
+                log.warning("DDG неожиданная ошибка (backend=%s): %s", backend, e)
+                break
+    log.error("DDG недоступен полностью, последняя ошибка: %s", last_error)
+    return []
 
 
-async def search_images(query: str, limit: int = MAX_RESULTS) -> list[dict[str, Any]]:
-    return await asyncio.to_thread(_search_images_sync, query, limit)
+async def search_images_ddg(query: str, limit: int = MAX_RESULTS) -> list[dict[str, Any]]:
+    try:
+        return await asyncio.to_thread(_search_images_sync, query, limit)
+    except Exception as e:
+        log.error("DDG поток упал: %s", e)
+        return []
+
+
+# ---------- поиск: Wikimedia ----------
+def _is_usable_image(title: str, url: str) -> bool:
+    low = f"{title} {url}".lower()
+    if not low.split("?")[0].endswith(GOOD_EXTENSIONS):
+        return False
+    return not any(marker in low for marker in BAD_IMAGE_MARKERS)
+
+
+async def _wiki_api(client: httpx.AsyncClient, host: str, params: dict[str, Any]) -> dict[str, Any]:
+    params = {**params, "format": "json", "formatversion": 2}
+    r = await client.get(
+        f"https://{host}/w/api.php", params=params, headers=WIKI_HEADERS, timeout=WIKI_TIMEOUT
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+async def _wikipedia_article_images(
+    client: httpx.AsyncClient, query: str, lang: str, limit: int
+) -> list[dict[str, Any]]:
+    """Картинки со страницы статьи о ВУЗе — самые релевантные."""
+    host = f"{lang}.wikipedia.org"
+    try:
+        found = await _wiki_api(client, host, {
+            "action": "query", "list": "search", "srsearch": query, "srlimit": 1,
+        })
+        hits = found.get("query", {}).get("search", [])
+        if not hits:
+            return []
+        title = hits[0]["title"]
+
+        data = await _wiki_api(client, host, {
+            "action": "query", "titles": title,
+            "generator": "images", "gimlimit": limit * 2,
+            "prop": "imageinfo", "iiprop": "url", "iiurlwidth": 1024,
+        })
+        out = []
+        for page in data.get("query", {}).get("pages", []):
+            info = (page.get("imageinfo") or [{}])[0]
+            url = info.get("thumburl") or info.get("url")
+            if url and _is_usable_image(page.get("title", ""), url):
+                out.append({
+                    "image": url,
+                    "url": f"https://{host}/wiki/{title.replace(' ', '_')}",
+                })
+        return out
+    except Exception as e:
+        log.warning("Wikipedia (%s) не ответила: %s", lang, e)
+        return []
+
+
+async def _commons_search_images(
+    client: httpx.AsyncClient, query: str, limit: int
+) -> list[dict[str, Any]]:
+    """Прямой поиск по файлам Wikimedia Commons."""
+    try:
+        data = await _wiki_api(client, "commons.wikimedia.org", {
+            "action": "query",
+            "generator": "search", "gsrsearch": query,
+            "gsrnamespace": 6, "gsrlimit": limit * 2,
+            "prop": "imageinfo", "iiprop": "url", "iiurlwidth": 1024,
+        })
+        out = []
+        for page in data.get("query", {}).get("pages", []):
+            info = (page.get("imageinfo") or [{}])[0]
+            url = info.get("thumburl") or info.get("url")
+            if url and _is_usable_image(page.get("title", ""), url):
+                out.append({
+                    "image": url,
+                    "url": info.get("descriptionurl")
+                           or f"https://commons.wikimedia.org/wiki/{page.get('title', '')}",
+                })
+        return out
+    except Exception as e:
+        log.warning("Commons не ответил: %s", e)
+        return []
+
+
+async def search_images_wiki(
+    client: httpx.AsyncClient, query: str, limit: int = MAX_RESULTS
+) -> list[dict[str, Any]]:
+    tasks = [_wikipedia_article_images(client, query, lang, limit) for lang in WIKI_LANGS]
+    tasks.append(_commons_search_images(client, query, limit))
+
+    try:
+        batches = await asyncio.wait_for(
+            asyncio.gather(*tasks, return_exceptions=True), timeout=WIKI_TIMEOUT * 2
+        )
+    except asyncio.TimeoutError:
+        log.error("Wikimedia: общий таймаут")
+        return []
+
+    merged: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for batch in batches:
+        if isinstance(batch, Exception):
+            continue
+        for item in batch:
+            if item["image"] not in seen:
+                seen.add(item["image"])
+                merged.append(item)
+    return merged[:limit]
 
 
 # ---------- загрузка ----------
@@ -103,7 +258,6 @@ async def phash(raw: bytes) -> imagehash.ImageHash | None:
 
 # ---------- классификация ----------
 def _to_b64_jpeg_sync(raw: bytes) -> str | None:
-    """Ужимаем до 336px и перекодируем в JPEG — payload падает в 10-30 раз."""
     try:
         img = Image.open(io.BytesIO(raw))
         img.draft("RGB", (CLASSIFY_MAX_SIDE, CLASSIFY_MAX_SIDE))
@@ -117,8 +271,7 @@ def _to_b64_jpeg_sync(raw: bytes) -> str | None:
 
 
 async def classify_image_hf(
-    image_bytes: bytes,
-    client: httpx.AsyncClient | None = None,
+    image_bytes: bytes, client: httpx.AsyncClient | None = None
 ) -> tuple[str, float]:
     if not HF_TOKEN:
         return FALLBACK_CATEGORY, FALLBACK_SCORE
@@ -131,7 +284,7 @@ async def classify_image_hf(
     headers = {
         "Authorization": f"Bearer {HF_TOKEN}",
         "Content-Type": "application/json",
-        "x-wait-for-model": "true",   # ждать прогрева вместо 503
+        "x-wait-for-model": "true",
     }
 
     own_client = client is None
@@ -141,8 +294,8 @@ async def classify_image_hf(
             for url in HF_ENDPOINTS:
                 try:
                     r = await client.post(url, json=payload, headers=headers, timeout=HF_TIMEOUT)
-                    if r.status_code in (404, 400):
-                        continue                      # эндпоинт не тот — пробуем следующий
+                    if r.status_code in (400, 404):
+                        continue
                     r.raise_for_status()
                     data = r.json()
                     if not isinstance(data, list) or not data:
@@ -168,47 +321,85 @@ async def health() -> dict[str, Any]:
 @app.get("/api/search")
 async def search(q: str = Query(..., min_length=2, description="Название ВУЗа")) -> dict[str, Any]:
     started = time.perf_counter()
+    source = "none"
+    warnings: list[str] = []
 
-    raw_results = await search_images(f"{q} университет кампус", MAX_RESULTS)
-
-    limits = httpx.Limits(max_connections=20, max_keepalive_connections=10)
-    async with httpx.AsyncClient(limits=limits, headers=HEADERS) as client:
-        downloaded = await asyncio.gather(*(fetch_image(client, it) for it in raw_results))
-        candidates = [d for d in downloaded if d]
-
-        hashes = await asyncio.gather(*(phash(d["bytes"]) for d in candidates))
-
-        unique: list[dict[str, Any]] = []
-        kept_hashes: list[imagehash.ImageHash] = []
-        for data, h in zip(candidates, hashes):
-            if h is None or any(h - kept <= HASH_DISTANCE_THRESHOLD for kept in kept_hashes):
-                continue
-            kept_hashes.append(h)
-            unique.append(data)
-
-        candidates.clear()   # освобождаем байты отсеянных — важно на 512MB
-
-        try:
-            verdicts = await asyncio.wait_for(
-                asyncio.gather(*(classify_image_hf(d["bytes"], client) for d in unique)),
-                timeout=HF_TOTAL_BUDGET,
-            )
-        except asyncio.TimeoutError:
-            verdicts = [(FALLBACK_CATEGORY, FALLBACK_SCORE)] * len(unique)
-
-    items = [
-        {
-            "url": d["url"],
-            "source_url": d["source_url"],
-            "category": category,
-            "confidence_score": score,
-            "is_verified": score >= 0.60,
+    def envelope(items: list[dict[str, Any]]) -> dict[str, Any]:
+        return {
+            "university": q,
+            "processing_time_sec": round(time.perf_counter() - started, 2),
+            "source": source,
+            "warnings": warnings,
+            "items": items,
         }
-        for d, (category, score) in zip(unique, verdicts)
-    ]
 
-    return {
-        "university": q,
-        "processing_time_sec": round(time.perf_counter() - started, 2),
-        "items": items,
-    }
+    try:
+        limits = httpx.Limits(max_connections=20, max_keepalive_connections=10)
+        async with httpx.AsyncClient(limits=limits, headers=HEADERS) as client:
+            # 1. поиск: DDG -> Wikimedia
+            raw_results = await search_images_ddg(f"{q} университет кампус", MAX_RESULTS)
+            if raw_results:
+                source = "duckduckgo"
+            else:
+                warnings.append("duckduckgo_unavailable")
+                raw_results = await search_images_wiki(client, q, MAX_RESULTS)
+                source = "wikimedia" if raw_results else "none"
+
+            if not raw_results:
+                warnings.append("no_results")
+                return envelope([])
+
+            # 2. загрузка
+            downloaded = await asyncio.gather(
+                *(fetch_image(client, it) for it in raw_results), return_exceptions=True
+            )
+            candidates = [d for d in downloaded if isinstance(d, dict)]
+            if not candidates:
+                warnings.append("download_failed")
+                return envelope([])
+
+            # 3. дедупликация
+            hashes = await asyncio.gather(
+                *(phash(d["bytes"]) for d in candidates), return_exceptions=True
+            )
+            unique: list[dict[str, Any]] = []
+            kept: list[imagehash.ImageHash] = []
+            for data, h in zip(candidates, hashes):
+                if not isinstance(h, imagehash.ImageHash):
+                    continue
+                if any(h - k <= HASH_DISTANCE_THRESHOLD for k in kept):
+                    continue
+                kept.append(h)
+                unique.append(data)
+            candidates.clear()
+
+            if not unique:
+                warnings.append("no_unique_images")
+                return envelope([])
+
+            # 4. классификация
+            try:
+                verdicts = await asyncio.wait_for(
+                    asyncio.gather(*(classify_image_hf(d["bytes"], client) for d in unique)),
+                    timeout=HF_TOTAL_BUDGET,
+                )
+            except Exception:
+                warnings.append("classification_fallback")
+                verdicts = [(FALLBACK_CATEGORY, FALLBACK_SCORE)] * len(unique)
+
+        items = [
+            {
+                "url": d["url"],
+                "source_url": d["source_url"],
+                "category": category,
+                "confidence_score": score,
+                "is_verified": score >= 0.60,
+            }
+            for d, (category, score) in zip(unique, verdicts)
+        ]
+        return envelope(items)
+
+    except Exception as e:
+        log.exception("Непредвиденная ошибка в /api/search")
+        warnings.append(f"internal_error: {type(e).__name__}")
+        return envelope([])
