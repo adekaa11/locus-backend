@@ -77,19 +77,16 @@ CATEGORY_QUERIES: dict[str, list[str]] = {
 
 # =========================================================
 # КОНФИГ
-# =========================================================
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
-HF_MODEL = os.getenv("HF_MODEL", "laion/CLIP-ViT-B-32-laion2B-s34B-b79K")
+HF_MODEL = os.getenv("HF_MODEL", "google/siglip-base-patch16-224")
 
-# ЕДИНСТВЕННЫЙ хост. api-inference.huggingface.co исключён: он не резолвится
-# ни системно, ни через DoH — это снятый с эксплуатации домен, а не сбой Render.
 HF_HOST = os.getenv("HF_HOST", "router.huggingface.co")
 HF_HOSTS = (HF_HOST,)
-# Разные схемы путей одного и того же роутера: какой из них жив, выясняем на месте.
+
 HF_ENDPOINTS = [
-    f"https://{HF_HOST}/hf-inference/models/{HF_MODEL}",
-    f"https://{HF_HOST}/hf-inference/models/{HF_MODEL}/pipeline/zero-shot-image-classification",
+    f"https://{HF_HOST}/hf-inference/v1/models/{HF_MODEL}",
     f"https://{HF_HOST}/models/{HF_MODEL}",
+
 ]
 
 HF_TIMEOUT = float(os.getenv("HF_TIMEOUT", "15"))
