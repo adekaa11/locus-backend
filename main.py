@@ -4,6 +4,7 @@ import io
 import logging
 import os
 import re
+import socket
 import time
 from collections import defaultdict
 from typing import Any
@@ -45,7 +46,7 @@ app.add_middleware(
 CATEGORIES = ("campus", "labs", "sport", "dormitory", "student_life", "city")
 
 # CLIP сравнивает картинку с ТЕКСТОМ, поэтому метки — развёрнутые фразы,
-# а не одно слово: "campus" даёт куда худшее разделение, чем полное описание сцены.
+# а не одно слово: "campus" даёт куда худшее разделение, чем описание сцены.
 PROMPTS: dict[str, str] = {
     "campus": "a photo of a university campus building exterior",
     "labs": "a photo of a science laboratory with equipment",
@@ -119,7 +120,8 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; LocusBot/1.0)"}
 GOOD_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp")
 
 # Слова-маркеры мусора. Сверяются с ОТДЕЛЬНЫМИ СЛОВАМИ имени файла,
-# а не с подстрокой URL: "order" внутри "border", "person" внутри "personal".
+# а не с подстрокой URL: "order" внутри "border", "person" внутри "personal",
+# а "commons" вообще есть в пути каждого файла Wikimedia.
 BAD_TOKENS = {
     "logo", "icon", "seal", "emblem", "crest", "coat", "arms", "badge", "flag",
     "map", "puzzle", "award", "awards", "medal", "medals", "order", "orders",
@@ -145,6 +147,89 @@ _hf_semaphore = asyncio.Semaphore(HF_CONCURRENCY)
 _summary_cache: dict[str, str] = {}
 _hf_last_error: str = ""          # видно через /health — главный инструмент отладки
 _hf_ready = False
+
+
+# =========================================================
+# ОБХОД DNS: системный резолвер Render не отдаёт адреса Hugging Face
+# =========================================================
+DOH_SERVERS = ["https://1.1.1.1/dns-query", "https://8.8.8.8/resolve"]
+HF_HOSTS = ("router.huggingface.co", "api-inference.huggingface.co")
+
+_dns_overrides: dict[str, str] = {}
+_real_getaddrinfo = socket.getaddrinfo
+_dns_lock = asyncio.Lock()
+_dns_report: dict[str, str] = {}
+
+
+def _patched_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    ip = _dns_overrides.get(host)
+    if ip:
+        # Подменяем только адрес. httpx по-прежнему знает имя хоста,
+        # поэтому SNI и проверка сертификата работают штатно.
+        return _real_getaddrinfo(ip, port, socket.AF_INET, type, proto, flags)
+    return _real_getaddrinfo(host, port, family, type, proto, flags)
+
+
+def _resolves(host: str) -> bool:
+    try:
+        _real_getaddrinfo(host, 443, socket.AF_INET)
+        return True
+    except Exception:
+        return False
+
+
+async def _doh_resolve(host: str) -> str | None:
+    """A-запись через DNS-over-HTTPS. Обращение по IP, системный DNS не участвует."""
+    async with httpx.AsyncClient(timeout=6.0) as client:
+        for base in DOH_SERVERS:
+            try:
+                r = await client.get(
+                    base,
+                    params={"name": host, "type": "A"},
+                    headers={"accept": "application/dns-json"},
+                )
+                r.raise_for_status()
+                for ans in r.json().get("Answer", []):
+                    if ans.get("type") == 1:          # 1 = A-запись
+                        return ans["data"]
+            except Exception as e:
+                log.warning("DoH %s не ответил для %s: %s", base, host, e)
+    return None
+
+
+async def ensure_hf_dns(force: bool = False) -> dict[str, str]:
+    """Один раз выясняет адреса HF и включает подмену резолвера."""
+    global _hf_last_error, _dns_report
+
+    async with _dns_lock:
+        if _dns_report and not force:
+            return _dns_report
+
+        report: dict[str, str] = {}
+        for host in HF_HOSTS:
+            if host in _dns_overrides and not force:
+                report[host] = f"{_dns_overrides[host]} (override)"
+                continue
+            if _resolves(host):
+                report[host] = "системный DNS ok"
+                continue
+            ip = await _doh_resolve(host)
+            if ip:
+                _dns_overrides[host] = ip
+                report[host] = f"{ip} (через DoH)"
+                log.info("DNS обход: %s -> %s", host, ip)
+            else:
+                report[host] = "не резолвится ни системно, ни через DoH"
+
+        if _dns_overrides and socket.getaddrinfo is not _patched_getaddrinfo:
+            socket.getaddrinfo = _patched_getaddrinfo
+            log.info("socket.getaddrinfo подменён для %s", list(_dns_overrides))
+
+        if not any(h in _dns_overrides or "ok" in report[h] for h in HF_HOSTS):
+            _hf_last_error = "DNS: адреса Hugging Face получить не удалось"
+
+        _dns_report = report
+        return report
 
 
 # =========================================================
@@ -338,13 +423,13 @@ def _balance(items: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
         buckets[it.get("category_hint")].append(it)
     order = [c for c in CATEGORIES if c in buckets] + ([None] if None in buckets else [])
     out: list[dict[str, Any]] = []
-    i = 0
+    guard = 0
     while len(out) < limit and any(buckets[c] for c in order):
         for c in order:
             if buckets[c] and len(out) < limit:
                 out.append(buckets[c].pop(0))
-        i += 1
-        if i > limit:
+        guard += 1
+        if guard > limit:
             break
     return out
 
@@ -363,6 +448,7 @@ def _split_sentences(text: str) -> list[str]:
         if sentences:
             words = sentences[-1].rstrip(".!?").split()
             tail = words[-1].lower().strip("«»\"'()") if words else ""
+            # «им.», «г.», «К.И.» — точка внутри сокращения, склеиваем обратно
             if tail in ABBREVIATIONS or (len(tail) <= 1 and tail.isalpha()):
                 sentences[-1] = f"{sentences[-1]} {part}"
                 continue
@@ -381,6 +467,7 @@ def _shorten(text: str) -> str:
 
 
 async def _summary_from_lang(client: httpx.AsyncClient, query: str, lang: str) -> str:
+    """Одним запросом: поиск статьи + извлечение интро (generator=search + prop=extracts)."""
     try:
         data = await _wiki_api(client, f"{lang}.wikipedia.org", {
             "action": "query", "generator": "search", "gsrsearch": query,
@@ -394,6 +481,7 @@ async def _summary_from_lang(client: httpx.AsyncClient, query: str, lang: str) -
         if not extract:
             return ""
         if any(m in extract.lower() for m in DISAMBIGUATION_MARKERS):
+            log.info("Wikipedia (%s): страница значений, пропускаем", lang)
             return ""
         return _shorten(extract)
     except Exception as e:
@@ -402,6 +490,7 @@ async def _summary_from_lang(client: httpx.AsyncClient, query: str, lang: str) -
 
 
 async def get_university_summary(client: httpx.AsyncClient, query: str) -> str:
+    """Краткое описание ВУЗа (2-3 предложения). Никогда не бросает исключение."""
     cache_key = query.strip().lower()
     if cache_key in _summary_cache:
         return _summary_cache[cache_key]
@@ -472,6 +561,8 @@ async def _hf_call(client: httpx.AsyncClient, b64: str) -> list[dict[str, Any]] 
     """Один вызов HF. Пишет причину отказа в _hf_last_error — иначе отладка вслепую."""
     global _hf_last_error, _hf_ready
 
+    await ensure_hf_dns()      # повторные вызовы дёшевы, работа идёт один раз
+
     payload = {"inputs": b64, "parameters": {"candidate_labels": CANDIDATE_LABELS}}
     headers = {
         "Authorization": f"Bearer {HF_TOKEN}",
@@ -498,6 +589,9 @@ async def _hf_call(client: httpx.AsyncClient, b64: str) -> list[dict[str, Any]] 
         except httpx.TimeoutException:
             _hf_last_error = f"таймаут {HF_TIMEOUT} с"
             log.warning("HF таймаут на %s", url)
+        except httpx.ConnectError as e:
+            _hf_last_error = f"ConnectError: {e}"
+            log.warning("HF соединение не открылось (%s): %s", url, e)
         except Exception as e:
             _hf_last_error = f"{type(e).__name__}: {e}"
             log.warning("HF ошибка на %s: %s", url, e)
@@ -542,6 +636,7 @@ async def _warmup() -> None:
     if not (HF_TOKEN and HF_WARMUP):
         return
     try:
+        await ensure_hf_dns()
         buf = io.BytesIO()
         Image.new("RGB", (224, 224), (120, 140, 160)).save(buf, format="JPEG")
         b64 = base64.b64encode(buf.getvalue()).decode()
@@ -567,8 +662,22 @@ async def health() -> dict[str, Any]:
         "hf_enabled": bool(HF_TOKEN),
         "hf_ready": _hf_ready,
         "hf_last_error": _hf_last_error or None,
+        "dns_overrides": dict(_dns_overrides),
         "model": HF_MODEL,
         "categories": list(CATEGORIES),
+    }
+
+
+@app.get("/api/netcheck")
+async def netcheck(force: bool = Query(False, description="Перерезолвить заново")) -> dict[str, Any]:
+    """Что резолвится, а что нет — отличает блокировку домена от поломки DNS."""
+    probes = list(HF_HOSTS) + ["commons.wikimedia.org", "ru.wikipedia.org", "example.com"]
+    system = {h: _resolves(h) for h in probes}
+    return {
+        "system_dns": system,
+        "hf_dns": await ensure_hf_dns(force=force),
+        "overrides": dict(_dns_overrides),
+        "patched": socket.getaddrinfo is _patched_getaddrinfo,
     }
 
 
@@ -582,13 +691,20 @@ async def diagnose() -> dict[str, Any]:
     b64 = base64.b64encode(buf.getvalue()).decode()
     async with httpx.AsyncClient() as client:
         data = await _hf_call(client, b64)
-    return {"ok": data is not None, "last_error": _hf_last_error or None, "raw": data}
+    return {
+        "ok": data is not None,
+        "last_error": _hf_last_error or None,
+        "dns": dict(_dns_overrides),
+        "raw": data,
+    }
 
 
 @app.get("/api/search")
 async def search(
     q: str = Query(..., min_length=2, description="Название ВУЗа"),
-    category: str | None = Query(None, description="Фильтр: campus|labs|sport|dormitory|student_life|city"),
+    category: str | None = Query(
+        None, description="Фильтр: campus|labs|sport|dormitory|student_life|city"
+    ),
 ) -> dict[str, Any]:
     started = time.perf_counter()
     source = "none"
@@ -610,6 +726,7 @@ async def search(
         }
 
     async def collect_summary() -> str:
+        """Забирает результат фоновой задачи, чем бы она ни кончилась."""
         if summary_task is None:
             return ""
         try:
@@ -622,6 +739,7 @@ async def search(
     try:
         limits = httpx.Limits(max_connections=24, max_keepalive_connections=12)
         async with httpx.AsyncClient(limits=limits, headers=HEADERS) as client:
+            # 0. описание стартует сразу и тикает параллельно всему остальному
             summary_task = asyncio.create_task(get_university_summary(client, q))
 
             # 1. поиск по категориям: DDG -> Wikimedia
@@ -679,9 +797,10 @@ async def search(
                 warnings.append("classification_timeout")
                 verdicts = [(None, 0.0, False)] * len(unique)
 
+            # 5. описание к этому моменту почти наверняка готово — ждать нечего
             description = await collect_summary()
 
-        # 5. сборка: мусор выбрасываем, при отказе CLIP берём категорию запроса
+        # 6. сборка: мусор выбрасываем, при отказе CLIP берём категорию запроса
         items: list[dict[str, Any]] = []
         rejected = 0
         degraded = 0
