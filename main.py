@@ -79,7 +79,7 @@ CATEGORY_QUERIES: dict[str, list[str]] = {
 # КОНФИГ
 # =========================================================
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
-HF_MODEL = os.getenv("HF_MODEL", "openai/clip-vit-base-patch32")
+HF_MODEL = os.getenv("HF_MODEL", "laion/CLIP-ViT-B-32-laion2B-s34B-b79K")
 
 # ЕДИНСТВЕННЫЙ хост. api-inference.huggingface.co исключён: он не резолвится
 # ни системно, ни через DoH — это снятый с эксплуатации домен, а не сбой Render.
