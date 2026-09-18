@@ -80,9 +80,16 @@ CATEGORY_QUERIES: dict[str, list[str]] = {
 # =========================================================
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
 HF_MODEL = os.getenv("HF_MODEL", "openai/clip-vit-base-patch32")
+
+# ЕДИНСТВЕННЫЙ хост. api-inference.huggingface.co исключён: он не резолвится
+# ни системно, ни через DoH — это снятый с эксплуатации домен, а не сбой Render.
+HF_HOST = os.getenv("HF_HOST", "router.huggingface.co")
+HF_HOSTS = (HF_HOST,)
+# Разные схемы путей одного и того же роутера: какой из них жив, выясняем на месте.
 HF_ENDPOINTS = [
-    f"https://router.huggingface.co/hf-inference/models/{HF_MODEL}",
-    f"https://api-inference.huggingface.co/models/{HF_MODEL}",
+    f"https://{HF_HOST}/hf-inference/models/{HF_MODEL}",
+    f"https://{HF_HOST}/hf-inference/models/{HF_MODEL}/pipeline/zero-shot-image-classification",
+    f"https://{HF_HOST}/models/{HF_MODEL}",
 ]
 
 HF_TIMEOUT = float(os.getenv("HF_TIMEOUT", "15"))
@@ -146,14 +153,15 @@ DISAMBIGUATION_MARKERS = ("может означать", "may refer to", "мағ
 _hf_semaphore = asyncio.Semaphore(HF_CONCURRENCY)
 _summary_cache: dict[str, str] = {}
 _hf_last_error: str = ""          # видно через /health — главный инструмент отладки
+_hf_attempts: list[str] = []      # что именно ответил каждый путь роутера
 _hf_ready = False
+_hf_endpoint_ok: str = ""         # рабочий путь: найден один раз — используется всегда
 
 
 # =========================================================
-# ОБХОД DNS: системный резолвер Render не отдаёт адреса Hugging Face
+# ОБХОД DNS
 # =========================================================
 DOH_SERVERS = ["https://1.1.1.1/dns-query", "https://8.8.8.8/resolve"]
-HF_HOSTS = ("router.huggingface.co", "api-inference.huggingface.co")
 
 _dns_overrides: dict[str, str] = {}
 _real_getaddrinfo = socket.getaddrinfo
@@ -198,7 +206,7 @@ async def _doh_resolve(host: str) -> str | None:
 
 
 async def ensure_hf_dns(force: bool = False) -> dict[str, str]:
-    """Один раз выясняет адреса HF и включает подмену резолвера."""
+    """Проверяет адрес рабочего хоста HF и при нужде включает подмену резолвера."""
     global _hf_last_error, _dns_report
 
     async with _dns_lock:
@@ -212,6 +220,7 @@ async def ensure_hf_dns(force: bool = False) -> dict[str, str]:
                 continue
             if _resolves(host):
                 report[host] = "системный DNS ok"
+                _dns_overrides.pop(host, None)      # системный резолвер снова жив
                 continue
             ip = await _doh_resolve(host)
             if ip:
@@ -226,7 +235,7 @@ async def ensure_hf_dns(force: bool = False) -> dict[str, str]:
             log.info("socket.getaddrinfo подменён для %s", list(_dns_overrides))
 
         if not any(h in _dns_overrides or "ok" in report[h] for h in HF_HOSTS):
-            _hf_last_error = "DNS: адреса Hugging Face получить не удалось"
+            _hf_last_error = f"DNS: адрес {HF_HOST} получить не удалось"
 
         _dns_report = report
         return report
@@ -558,8 +567,8 @@ def _to_b64_jpeg_sync(raw: bytes) -> str | None:
 
 
 async def _hf_call(client: httpx.AsyncClient, b64: str) -> list[dict[str, Any]] | None:
-    """Один вызов HF. Пишет причину отказа в _hf_last_error — иначе отладка вслепую."""
-    global _hf_last_error, _hf_ready
+    """Один вызов HF. Все попытки протоколируются: ошибка последней не затирает прочие."""
+    global _hf_last_error, _hf_ready, _hf_endpoint_ok, _hf_attempts
 
     await ensure_hf_dns()      # повторные вызовы дёшевы, работа идёт один раз
 
@@ -569,32 +578,44 @@ async def _hf_call(client: httpx.AsyncClient, b64: str) -> list[dict[str, Any]] 
         "Content-Type": "application/json",
         "x-wait-for-model": "true",
     }
-    for url in HF_ENDPOINTS:
+
+    # рабочий путь, найденный ранее, пробуем первым
+    urls = HF_ENDPOINTS if not _hf_endpoint_ok else (
+        [_hf_endpoint_ok] + [u for u in HF_ENDPOINTS if u != _hf_endpoint_ok]
+    )
+    attempts: list[str] = []
+
+    for url in urls:
+        tail = url.removeprefix(f"https://{HF_HOST}")
         try:
             r = await client.post(url, json=payload, headers=headers, timeout=HF_TIMEOUT)
             if r.status_code == 200:
                 data = r.json()
                 if isinstance(data, list) and data:
                     _hf_last_error = ""
+                    _hf_attempts = attempts + [f"{tail} -> 200 ok"]
                     _hf_ready = True
+                    _hf_endpoint_ok = url
                     return data
-                _hf_last_error = f"200, но ответ не список: {str(data)[:200]}"
+                attempts.append(f"{tail} -> 200, но ответ не список: {str(data)[:120]}")
                 continue
-            _hf_last_error = f"HTTP {r.status_code}: {r.text[:200]}"
-            log.warning("HF %s -> %s", url, _hf_last_error)
-            if r.status_code in (400, 404):
-                continue          # не тот эндпоинт/формат — пробуем следующий
+            attempts.append(f"{tail} -> HTTP {r.status_code}: {r.text[:150]}")
+            log.warning("HF %s -> %s %s", tail, r.status_code, r.text[:150])
             if r.status_code in (401, 403):
-                return None       # токен не тот, повторять бессмысленно
+                break             # токен не тот, остальные пути не спасут
         except httpx.TimeoutException:
-            _hf_last_error = f"таймаут {HF_TIMEOUT} с"
-            log.warning("HF таймаут на %s", url)
+            attempts.append(f"{tail} -> таймаут {HF_TIMEOUT} с")
+            log.warning("HF таймаут на %s", tail)
         except httpx.ConnectError as e:
-            _hf_last_error = f"ConnectError: {e}"
-            log.warning("HF соединение не открылось (%s): %s", url, e)
+            attempts.append(f"{tail} -> ConnectError: {e}")
+            log.warning("HF соединение не открылось (%s): %s", tail, e)
         except Exception as e:
-            _hf_last_error = f"{type(e).__name__}: {e}"
-            log.warning("HF ошибка на %s: %s", url, e)
+            attempts.append(f"{tail} -> {type(e).__name__}: {e}")
+            log.warning("HF ошибка на %s: %s", tail, e)
+
+    _hf_attempts = attempts
+    _hf_last_error = "; ".join(attempts)[:400] if attempts else "неизвестная ошибка"
+    _hf_endpoint_ok = ""       # сбрасываем: путь перестал работать
     return None
 
 
@@ -632,7 +653,7 @@ async def classify_image_hf(
 
 
 async def _warmup() -> None:
-    """Первый вызов будит модель (до 30 с). Делаем это на старте, а не на демо."""
+    """Первый вызов будит модель (до 30 с) и находит рабочий путь роутера."""
     if not (HF_TOKEN and HF_WARMUP):
         return
     try:
@@ -642,7 +663,8 @@ async def _warmup() -> None:
         b64 = base64.b64encode(buf.getvalue()).decode()
         async with httpx.AsyncClient() as client:
             await _hf_call(client, b64)
-        log.info("HF прогрев: ready=%s, error=%s", _hf_ready, _hf_last_error or "нет")
+        log.info("HF прогрев: ready=%s, endpoint=%s, error=%s",
+                 _hf_ready, _hf_endpoint_ok or "нет", _hf_last_error or "нет")
     except Exception as e:
         log.warning("HF прогрев не удался: %s", e)
 
@@ -661,6 +683,8 @@ async def health() -> dict[str, Any]:
         "status": "ok",
         "hf_enabled": bool(HF_TOKEN),
         "hf_ready": _hf_ready,
+        "hf_host": HF_HOST,
+        "hf_endpoint_ok": _hf_endpoint_ok or None,
         "hf_last_error": _hf_last_error or None,
         "dns_overrides": dict(_dns_overrides),
         "model": HF_MODEL,
@@ -672,9 +696,9 @@ async def health() -> dict[str, Any]:
 async def netcheck(force: bool = Query(False, description="Перерезолвить заново")) -> dict[str, Any]:
     """Что резолвится, а что нет — отличает блокировку домена от поломки DNS."""
     probes = list(HF_HOSTS) + ["commons.wikimedia.org", "ru.wikipedia.org", "example.com"]
-    system = {h: _resolves(h) for h in probes}
     return {
-        "system_dns": system,
+        "hf_host": HF_HOST,
+        "system_dns": {h: _resolves(h) for h in probes},
         "hf_dns": await ensure_hf_dns(force=force),
         "overrides": dict(_dns_overrides),
         "patched": socket.getaddrinfo is _patched_getaddrinfo,
@@ -693,6 +717,8 @@ async def diagnose() -> dict[str, Any]:
         data = await _hf_call(client, b64)
     return {
         "ok": data is not None,
+        "endpoint_ok": _hf_endpoint_ok or None,
+        "attempts": _hf_attempts,          # по одной строке на каждый путь роутера
         "last_error": _hf_last_error or None,
         "dns": dict(_dns_overrides),
         "raw": data,
@@ -787,7 +813,8 @@ async def search(
 
             unique = _balance(unique, MAX_CLASSIFY)
 
-            # 4. классификация
+            # 4. классификация: адрес хоста готовим до, а не внутри 14 параллельных задач
+            await ensure_hf_dns()
             try:
                 verdicts = await asyncio.wait_for(
                     asyncio.gather(*(classify_image_hf(d["bytes"], client) for d in unique)),
